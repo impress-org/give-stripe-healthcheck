@@ -38,12 +38,10 @@ add_action( 'give_register_updates', 'give_stripe_healthcheck_notices' );
  */
 function give_stripe_healthcheck_fix_duplicate_card_sources_callback() {
 
-	global $wpdb;
-
 	require_once GIVE_STRIPE_PLUGIN_DIR . '/vendor/autoload.php';
 
 	$give_updates = Give_Updates::get_instance();
-	$donor_count = Give()->donors->count(
+	$donor_count  = Give()->donors->count(
 		array(
 			'number' => -1,
 		)
@@ -85,6 +83,7 @@ function give_stripe_healthcheck_fix_duplicate_card_sources_callback() {
 
 					\Stripe\Stripe::setApiKey( Give_Stripe_Gateway::get_secret_key() );
 
+					// Fetch the customer object based on customer id stored in db.
 					$customer    = \Stripe\Customer::retrieve( $stripe_customer_id );
 					$all_sources = $customer->sources->all( array(
 						'limit' => 100,
@@ -92,6 +91,8 @@ function give_stripe_healthcheck_fix_duplicate_card_sources_callback() {
 					) );
 
 					if ( count( $all_sources->data ) > 0 ) {
+
+						// Loop through sources of a particular customer to identify duplicated sources.
 						foreach ( $all_sources->data as $source_item ) {
 
 							$fingerprint = '';
@@ -99,6 +100,7 @@ function give_stripe_healthcheck_fix_duplicate_card_sources_callback() {
 								$fingerprint = $source_item->card->fingerprint;
 							}
 
+							// Check unique fingerprints and identify duplicate sources based on it.
 							if ( ! in_array( $fingerprint, $unique_fingerprints[ $donor->id ],true ) ) {
 								$unique_fingerprints[ $donor->id ][] = $fingerprint;
 								$unique_sources[ $donor->id ][]      = $source_item->id;

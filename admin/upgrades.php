@@ -20,7 +20,7 @@ function give_stripe_healthcheck_notices() {
 
 	Give_Updates::get_instance()->register(
 		array(
-			'id'       => 'give_stripe_healthcheck_fix_duplicate_card_sources',
+			'id'       => 'stripe_healthcheck_fix_duplicate_card_sources',
 			'version'  => '1.0.0',
 			'callback' => 'give_stripe_healthcheck_fix_duplicate_card_sources_callback',
 		)
@@ -40,327 +40,159 @@ function give_stripe_healthcheck_fix_duplicate_card_sources_callback() {
 
 	global $wpdb;
 
+	require_once GIVE_STRIPE_PLUGIN_DIR . '/vendor/autoload.php';
+
 	$give_updates = Give_Updates::get_instance();
+	$donor_count = Give()->donors->count(
+		array(
+			'number' => -1,
+		)
+	);
 
 	$donors = Give()->donors->get_donors(
 		array(
-			'number' => 100,
+			'order'  => 'ASC',
 			'paged'  => $give_updates->step,
+			'number' => 10,
 		)
 	);
 
-	require_once GIVE_STRIPE_PLUGIN_DIR . '/vendor/autoload.php';
+	$unique_sources      = array();
+	$duplicate_sources   = array();
+	$unique_fingerprints = array();
 
-	\Stripe\Stripe::setApiKey( Give_Stripe_Gateway::get_secret_key() );
+	if ( $donors ) {
 
-	if ( ! empty( $donors ) ) {
-		$give_updates->set_percentage( count( $donors ), $give_updates->step * 100 );
+		$give_updates->set_percentage( $donor_count, $give_updates->step * 10 );
 
 		foreach ( $donors as $donor ) {
 
+			$unique_sources[ $donor->id ]      = array();
+			$duplicate_sources[ $donor->id ]   = array();
+			$unique_fingerprints[ $donor->id ] = array();
 			$stripe_customer_id = Give()->donor_meta->get_meta( $donor->id, '_give_stripe_customer_id', true );
+
+			if ( empty( $stripe_customer_id ) ) {
+				$donation_ids    = explode( ',', $donor->payment_ids );
+				$total_donations = count( $donation_ids );
+				$recent_donation = $donation_ids[ $total_donations - 1 ];
+				$stripe_customer_id = give_get_meta( $recent_donation, '_give_stripe_customer_id', true );
+			}
 
 			if ( ! empty( $stripe_customer_id ) ) {
 
-				$customer    = \Stripe\Customer::retrieve( $stripe_customer_id );
-				$all_sources = $customer->sources->all();
+				try {
 
-				if ( count( $all_sources->data ) > 0 ) {
-					foreach ( $all_sources->data as $source_item ) {
+					\Stripe\Stripe::setApiKey( Give_Stripe_Gateway::get_secret_key() );
 
-						error_log( print_r( $source_item->id, true ) . "\n", 3, WP_CONTENT_DIR . '/debug_new.log' );
-					}
-				}
-			}
-		}
-	} else {
-error_log( print_r( 'success', true ) . "\n", 3, WP_CONTENT_DIR . '/debug_new.log' );
-give_die();
-	}
+					$customer    = \Stripe\Customer::retrieve( $stripe_customer_id );
+					$all_sources = $customer->sources->all( array(
+						'limit' => 100,
+						'object' => 'source',
+					) );
 
-}
+					if ( count( $all_sources->data ) > 0 ) {
+						foreach ( $all_sources->data as $source_item ) {
 
-/**
- * Fix corrupted payment meta if any
- *
- * @since 1.0.0
- */
-function give_db_healthcheck_post_200_data_callback() {
-	global $wpdb, $post;
-	$give_updates         = Give_Updates::get_instance();
-	$donation_id_col_name = Give()->payment_meta->get_meta_type() . '_id';
-	$donation_table       = Give()->payment_meta->table_name;
+							$fingerprint = '';
+							if ( give_stripe_healthcheck_is_source( $source_item->id ) ) {
+								$fingerprint = $source_item->card->fingerprint;
+							}
 
-	$payments = $wpdb->get_col(
-		"
-			SELECT ID FROM $wpdb->posts
-			WHERE 1=1
-			AND $wpdb->posts.post_type = 'give_payment'
-			AND {$wpdb->posts}.post_status IN ('" . implode( "','", array_keys( give_get_payment_statuses() ) ) . "')
-			ORDER BY $wpdb->posts.post_date ASC 
-			LIMIT 100
-			OFFSET " . $give_updates->get_offset( 100 )
-	);
-
-	if ( ! empty( $payments ) ) {
-		$give_updates->set_percentage( give_get_total_post_type_count( 'give_payment' ), $give_updates->get_offset( 100 ) );
-
-		foreach ( $payments as $payment_id ) {
-			$post = get_post( $payment_id );
-			setup_postdata( $post );
-
-			// Do not add new meta keys if already refactored.
-			if ( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$donation_table} WHERE {$donation_id_col_name}=%d AND meta_key=%s", $post->ID, '_give_payment_donor_id' ) ) ) {
-				continue;
-			}
-
-
-			// Split _give_payment_meta meta.
-			// @todo Remove _give_payment_meta after releases 2.0
-			$payment_meta = give_get_meta( $post->ID, '_give_payment_meta', true );
-
-			if ( ! empty( $payment_meta ) ) {
-				_give_20_bc_split_and_save_give_payment_meta( $post->ID, $payment_meta );
-			}
-
-			$deprecated_meta_keys = array(
-				'_give_payment_customer_id' => '_give_payment_donor_id',
-				'_give_payment_user_email'  => '_give_payment_donor_email',
-				'_give_payment_user_ip'     => '_give_payment_donor_ip',
-			);
-
-			foreach ( $deprecated_meta_keys as $old_meta_key => $new_meta_key ) {
-				// Do not add new meta key if already exist.
-				if ( $wpdb->get_var( $wpdb->prepare( "SELECT meta_id FROM {$donation_table} WHERE {$donation_id_col_name}=%d AND meta_key=%s", $post->ID, $new_meta_key ) ) ) {
-					continue;
-				}
-
-				$wpdb->insert(
-					$donation_table,
-					array(
-						"$donation_id_col_name" => $post->ID,
-						'meta_key'              => $new_meta_key,
-						'meta_value'            => give_get_meta( $post->ID, $old_meta_key, true ),
-					)
-				);
-			}
-
-			// Bailout
-			if ( $donor_id = give_get_meta( $post->ID, '_give_payment_donor_id', true ) ) {
-				/* @var Give_Donor $donor */
-				$donor = new Give_Donor( $donor_id );
-
-				$address['line1']   = give_get_meta( $post->ID, '_give_donor_billing_address1', true, '' );
-				$address['line2']   = give_get_meta( $post->ID, '_give_donor_billing_address2', true, '' );
-				$address['city']    = give_get_meta( $post->ID, '_give_donor_billing_city', true, '' );
-				$address['state']   = give_get_meta( $post->ID, '_give_donor_billing_state', true, '' );
-				$address['zip']     = give_get_meta( $post->ID, '_give_donor_billing_zip', true, '' );
-				$address['country'] = give_get_meta( $post->ID, '_give_donor_billing_country', true, '' );
-
-				// Save address.
-				$donor->add_address( 'billing[]', $address );
-			}
-
-		}// End while().
-
-		wp_reset_postdata();
-	} else {
-		// @todo Delete user id meta after releases 2.0
-		// $wpdb->get_var( $wpdb->prepare( "DELETE FROM $wpdb->postmeta WHERE meta_key=%s", '_give_payment_user_id' ) );
-
-		// No more forms found, finish up.
-		give_set_upgrade_complete( 'give_db_healthcheck_post_200_data' );
-	}
-}
-
-
-/**
- * Fix corrupted payment donor if any
- *
- * @since 0.0.2
- */
-function give_db_healthcheck_donation_donor_callback() {
-	global $wpdb;
-	$give_updates = Give_Updates::get_instance();
-
-	$payments = $wpdb->get_col(
-		"
-			SELECT ID FROM $wpdb->posts
-			WHERE 1=1
-			AND $wpdb->posts.post_type = 'give_payment'
-			AND {$wpdb->posts}.post_status IN ('" . implode( "','", array_keys( give_get_payment_statuses() ) ) . "')
-			ORDER BY $wpdb->posts.post_date ASC 
-			LIMIT 100
-			OFFSET " . $give_updates->get_offset( 100 )
-	);
-
-	if ( $payments ) {
-		foreach ( $payments as $payment ) {
-
-			if (
-				! give_get_meta( $payment, '_give_payment_donor_id', true )
-				&& ( $donor_email = give_get_meta( $payment, '_give_payment_donor_email', true ) )
-			) {
-				if ( $donor_id = Give()->donors->get_column_by( 'id', 'email', $donor_email ) ) {
-					give_update_meta( $payment, '_give_payment_donor_id', $donor_id );
-				}
-			}
-		}
-	} else {
-		// @todo Delete user id meta after releases 2.0
-		// $wpdb->get_var( $wpdb->prepare( "DELETE FROM $wpdb->postmeta WHERE meta_key=%s", '_give_payment_user_id' ) );
-
-		// No more forms found, finish up.
-		give_set_upgrade_complete( 'give_db_healthcheck_donation_donor' );
-	}
-}
-
-/**
- * Recover old payment data
- *
- * @since 0.0.3
- */
-function give_db_healthcheck_003_recover_old_paymentdata_callback() {
-	global $wpdb;
-
-	$give_updates         = Give_Updates::get_instance();
-	$donation_id_col_name = Give()->payment_meta->get_meta_type() . '_id';
-	$donation_table       = Give()->payment_meta->table_name;
-
-	// form query
-	$payments = new WP_Query( array(
-			'paged'          => $give_updates->step,
-			'status'         => 'any',
-			'order'          => 'ASC',
-			'post_type'      => array( 'give_payment' ),
-			'posts_per_page' => 100,
-		)
-	);
-
-	if ( $payments->have_posts() ) {
-		$give_updates->set_percentage( $payments->found_posts, $give_updates->step * 100 );
-
-		while ( $payments->have_posts() ) {
-			$payments->the_post();
-
-			$meta_data = $wpdb->get_results(
-				$wpdb->prepare(
-					"
-					SELECT * FROM $wpdb->postmeta
-					WHERE post_id=%d
-					",
-					get_the_ID()
-				),
-				ARRAY_A
-			);
-
-			if ( ! empty( $meta_data ) ) {
-				foreach ( $meta_data as $index => $data ) {
-					// ignore _give_payment_meta key.
-					if ( '_give_payment_meta' === $data['meta_key'] ) {
-						continue;
+							if ( ! in_array( $fingerprint, $unique_fingerprints[ $donor->id ],true ) ) {
+								$unique_fingerprints[ $donor->id ][] = $fingerprint;
+								$unique_sources[ $donor->id ][]      = $source_item->id;
+							} else {
+								$duplicate_sources[ $donor->id ][] = $source_item->id;
+							}
+						}
 					}
 
-					$is_duplicate_meta_key = $wpdb->get_results(
-						$wpdb->prepare(
-							"
-							SELECT * FROM {$donation_table}
-							WHERE meta_key=%s
-							AND {$donation_id_col_name}=%d
-							",
-							$data['meta_key'],
-							$data['post_id']
-						),
-						ARRAY_A
+					if (
+						isset( $unique_sources[ $donor->id ][0] ) &&
+						! empty( $unique_sources[ $donor->id ][0] ) &&
+						$unique_sources[ $donor->id ][0] !== $customer->default_source
+					) {
+						try {
+							$customer->default_source = $unique_sources[ $donor->id ][0];
+							$customer->save();
+						} catch ( Exception $e ) {
+							give_stripe_record_log(
+								__( 'Stripe Healthcheck - Error', 'give-stripe-healthcheck' ),
+								sprintf(
+									/* translators: 1. Customer ID, 2. Error Message. */
+									__( 'Unable to set default source for customer %1$s. Error: %2$s', 'give-stripe-healthcheck' ),
+									$customer->id,
+									$e->getMessage()
+								)
+							);
+						}
+					}
+
+					// Check whether the duplicate sources count is greater than 0.
+					if ( count( $duplicate_sources[ $donor->id ] ) > 0 ) {
+
+						// Loop through the list of duplicate sources and detach it from customer.
+						foreach ( $duplicate_sources[ $donor->id ] as $duplicate_source ) {
+							try {
+								$customer->sources->retrieve( $duplicate_source )->detach();
+
+								// Log success.
+								give_stripe_record_log(
+									__( 'Stripe Healthcheck - Success', 'give-stripe-healthcheck' ),
+									sprintf(
+										/* translators: 1. Source ID, 2. Customer ID. */
+										__( 'Successfully detached source %1$s from customer %2$s.', 'give-stripe-healthcheck' ),
+										$duplicate_source,
+										$customer->id
+									)
+								);
+
+							} catch ( Exception $e ) {
+								give_stripe_record_log(
+									__( 'Stripe Healthcheck - Error', 'give-stripe-healthcheck' ),
+									sprintf(
+										/* translators: 1. Source ID, 2. Customer ID, 3. Error Message. */
+										__( 'Unable to detach source %1$s from customer %2$s. Error: %3$s', 'give-stripe-healthcheck' ),
+										$duplicate_source,
+										$customer->id,
+										$e->getMessage()
+									)
+								);
+							}
+						}
+					}
+				} catch ( Exception $e ) {
+					give_stripe_record_log(
+						__( 'Stripe Healthcheck - Error', 'give-stripe-healthcheck' ),
+						sprintf(
+							/* translators: 1. Customer ID, 2. Error Message. */
+							__( 'Unable to retrieve customer %1$s. Error: %2$s', 'give-stripe-healthcheck' ),
+							$stripe_customer_id,
+							$e->getMessage()
+						)
 					);
-
-					if ( $is_duplicate_meta_key ) {
-
-						continue;
-					}
-
-					$data[ $donation_id_col_name ] = $data['post_id'];
-
-					unset( $data['post_id'] );
-					unset( $data['meta_id'] );
-
-					Give()->payment_meta->insert( $data );
-				}
-			}
-
-		}// End while().
-
-		wp_reset_postdata();
+				} // End try().
+			} // End if().
+		} // End foreach().
 	} else {
-		// No more forms found, finish up.
-		give_set_upgrade_complete( 'give_db_healthcheck_003_recover_old_paymentdata' );
-	}
+		give_set_upgrade_complete( 'stripe_healthcheck_fix_duplicate_card_sources' );
+	} // End if().
 }
 
-
 /**
- * Recover old donation meta data
+ * This function will check whether the ID provided is Source ID?
  *
- * @since 0.0.3
+ * @param string $id Source ID.
+ *
+ * @since  1.0.0
+ * @access public
+ *
+ * @return bool
  */
-function give_db_healthcheck_220_recover_donationmeta_callback(){
-	global $wpdb;
-	$give_updates = Give_Updates::get_instance();
-
-
-	$total_payments = $wpdb->get_results( "SELECT * FROM {$wpdb->prefix}give_paymentmeta", ARRAY_N );
-	$payments       = $wpdb->get_results(
-		"SELECT *
-				FROM {$wpdb->prefix}give_paymentmeta
-				ORDER BY meta_id ASC
-				LIMIT 100
-				OFFSET " . $give_updates->get_offset( 100 ),
-		ARRAY_A
+function give_stripe_healthcheck_is_source( $id ) {
+	return (
+		$id &&
+		preg_match( '/src_/i', $id )
 	);
-
-	if ( ! empty( $payments ) ) {
-		$give_updates->set_percentage( count( $total_payments ), $give_updates->step * 100 );
-
-		foreach ( $payments as $payment ) {
-			if( empty( $payment['meta_value'] ) ) {
-				continue;
-			}
-
-			$existing_donation_value = $wpdb->get_var(
-				$wpdb->prepare(
-					"SELECT meta_value
-					FROM {$wpdb->prefix}give_donationmeta
-					WHERE donation_id = %d
-					AND meta_key = %s
-					",
-					$payment['payment_id'],
-					$payment['meta_key']
-				)
-			);
-
-			if( $existing_donation_value !== $payment['meta_value'] ) {
-				$wpdb->replace(
-					"{$wpdb->prefix}give_donationmeta",
-					array(
-						'donation_id'    => $payment['payment_id'],
-						'meta_key'   => $payment['meta_key'],
-						'meta_value' => $payment['meta_value'],
-					),
-					array(
-						'%d',
-						'%s',
-						'%s'
-					)
-				);
-			}
-
-		}// End while().
-	}else{
-		if( ! give_has_upgrade_completed( 'v220_rename_donation_meta_type' ) ) {
-			give_set_upgrade_complete( 'v220_rename_donation_meta_type' );
-		}
-
-		// No more forms found, finish up.
-		give_set_upgrade_complete( 'give_db_healthcheck_220_recover_donationmeta' );
-	}
 }
